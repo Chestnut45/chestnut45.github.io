@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PBD Rope Simulation in Godot</title>
+    <link rel="stylesheet" href="/assets/css/syntax.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-dark.css">
+    <link rel="stylesheet" href="/assets/css/style.css">
+    <script src="/assets/js/main.js" defer></script>
+</head>
+
+<body class="tiled-bg">
+    <div class="navbar" id="mainNavBar">
+    <a href="/" class=""><i class="fa fa-house"></i></a>
+    <a href="/projects" class=""><i class="fa fa-code"></i> Projects</a>
+    <a href="/posts" class=""><i class="fa fa-terminal"></i> Posts</a>
+    <a href="/about" class=""><i class="fa fa-user"></i> About</a>
+    <a href="javascript:void(0);" class="icon" onclick="toggleNavBarExpansion()">
+        <i class="fa fa-bars"></i>
+    </a>
+</div>
+
+    <main class="markdown-body">
+        <h1 id="pbd-rope-simulation-in-godot">PBD Rope Simulation in Godot</h1>
+
+<p><img src="/assets/images/ropes.png" alt="ropes.png" /></p>
+
+<p>Over the past year or so, I’ve been working on a prototype for a game where ropes happen to play an important thematic role. It needs to cook for a while longer before there’s any official announcement, but I’d like to share some of my recent work developing a rope simulation for the game in the Godot engine.</p>
+
+<h1 id="the-algorithm">The Algorithm</h1>
+
+<p>For the initial implementation, I went with <a href="https://matthias-research.github.io/pages/publications/posBasedDyn.pdf">Position Based Dynamics</a> (PBD), for a few reasons:</p>
+
+<ul>
+  <li>It’s fast (like, really fast)</li>
+  <li>It’s stable</li>
+  <li>It’s simple to implement</li>
+</ul>
+
+<p>Here’s the algorithm in its entirety:</p>
+
+<p><img src="/assets/images/pbd.png" alt="pbd.png" /></p>
+
+<p>I won’t go into much detail about how this algorithm is derived or the math behind it, but if readers are interested, I recommend checking out the <a href="https://matthias-research.github.io/pages/publications/posBasedDyn.pdf">original paper</a>, or this <a href="https://carmencincotti.com/2022-08-01/the-pbd-simulation-loop/">lovely blog post</a> by Carmen Cincotti which helped me to better understand how it all works. In short, we iteratively correct the positions of the particles in order to fulfill distance constraints between them, and we reconstruct velocity each frame from the difference in positions between the current and previous frame, much like standard Verlet integration.</p>
+
+<p>PBD is general enough that with small extensions, it can be used to simulate fluid dynamics, cloth, and even rigid bodies, though the rope simulation will just be treated as a simple particle system with distance constraints between each particle along the rope’s length.</p>
+
+<p>There are some well-known drawbacks with standard PBD, such as the fact that the stiffness of the simulation is dependent on the number of solver iterations, as well as the time step used. In addition, PBD doesn’t provide any estimates for the forces acting on the particles, making two-way attachments more difficult to model.</p>
+
+<p>In the next (and hopefully final) implementation, I’ll address those issues by switching to a variation of PBD that I’ll refer to as Substep XPBD. <a href="https://matthias-research.github.io/pages/publications/XPBD.pdf">XPBD</a> (eXtended Position Based Dynamics) introduces the concept of a total Lagrange multiplier, which allows the constraints to be solved in a way that is independent of time step and iteration count as well as giving force estimates for each particle, while the change from iterations to <a href="https://matthias-research.github.io/pages/publications/smallsteps.pdf">substeps</a> will speed up the convergence rate of the simulation.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" class="footnote" rel="footnote">1</a></sup></p>
+
+<h1 id="implementation">Implementation</h1>
+
+<p>For simplicity, I’ll give shortened and simplified code examples in GDScript throughout the post to avoid getting bogged down explaining every single implementation detail, but the full unedited code is available at the <a href="#conclusion">bottom of the page</a> for those that are interested.</p>
+
+<p>For now, we’ll need to create a new script for the rope node, and give it some properties to store the particle data.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">class_name</span> <span class="n">PBDRope3D_GD</span> <span class="k">extends</span> <span class="n">MultiMeshInstance3D</span>
+
+<span class="k">var</span> <span class="n">positions</span><span class="p">:</span> <span class="n">PackedVector3Array</span>
+<span class="k">var</span> <span class="n">predicted</span><span class="p">:</span> <span class="n">PackedVector3Array</span>
+<span class="k">var</span> <span class="n">velocities</span><span class="p">:</span> <span class="n">PackedVector3Array</span>
+<span class="k">var</span> <span class="n">inverse_masses</span><span class="p">:</span> <span class="n">PackedFloat32Array</span>
+<span class="k">var</span> <span class="n">damping_factors</span><span class="p">:</span> <span class="n">PackedFloat32Array</span>
+</code></pre></div></div>
+
+<p>Then we need to initialize the particle data, and this will have to be done every time the rope has to be rebuilt (i.e. if the number of segments changes).</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">func</span> <span class="nf">rebuild</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="k">var</span> <span class="n">particle_count</span> <span class="p">:</span><span class="o">=</span> <span class="n">segment_count</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="n">positions</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">particle_count</span><span class="p">)</span>
+    <span class="n">predicted</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">particle_count</span><span class="p">)</span>
+    <span class="n">velocities</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">particle_count</span><span class="p">)</span>
+    <span class="n">inverse_masses</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">particle_count</span><span class="p">)</span>
+    <span class="n">damping_factors</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">particle_count</span><span class="p">)</span>
+
+    <span class="k">var</span> <span class="n">rng</span> <span class="p">:</span><span class="o">=</span> <span class="n">RandomNumberGenerator</span><span class="o">.</span><span class="n">new</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">particle_count</span><span class="p">):</span>
+        <span class="k">var</span> <span class="n">pos</span> <span class="p">:</span><span class="o">=</span> <span class="n">global_position</span> <span class="o">+</span> <span class="kt">Vector3</span><span class="p">(</span><span class="n">rng</span><span class="o">.</span><span class="nb">randf</span><span class="p">(),</span> <span class="n">rng</span><span class="o">.</span><span class="nb">randf</span><span class="p">(),</span> <span class="n">rng</span><span class="o">.</span><span class="nb">randf</span><span class="p">())</span> <span class="o">*</span> <span class="mf">0.001</span>
+        <span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">pos</span>
+        <span class="n">predicted</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">pos</span>
+        <span class="n">velocities</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="kt">Vector3</span><span class="o">.</span><span class="n">ZERO</span>
+        <span class="n">damping_factors</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>
+
+    <span class="n">regenerate_particle_masses</span><span class="p">()</span>
+    <span class="n">rebuild_mesh</span><span class="p">()</span>
+    <span class="n">update_mesh</span><span class="p">()</span>
+    <span class="n">dirty</span> <span class="o">=</span> <span class="bp">false</span>
+</code></pre></div></div>
+
+<p>This includes calculating each particle’s mass, which is stored as inverse mass for efficiency reasons. For simplicity, the user defines a single mass value for all particles, and then anchored particles are given an inverse mass of 0 (infinite mass). This makes sure that constraint projection doesn’t attempt to move anchored particles.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">func</span> <span class="nf">regenerate_particle_masses</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="k">var</span> <span class="n">particle_inv_mass</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="n">particle_mass</span>
+    <span class="n">inverse_masses</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span> <span class="k">if</span> <span class="n">anchor_start</span> <span class="k">else</span> <span class="n">particle_inv_mass</span>
+    <span class="n">inverse_masses</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span> <span class="k">if</span> <span class="n">use_rotation</span> <span class="k">else</span> <span class="n">particle_inv_mass</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">segment_count</span> <span class="o">+</span> <span class="mi">1</span><span class="p">):</span>
+        <span class="n">inverse_masses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">particle_inv_mass</span>
+
+    <span class="o">...</span> <span class="c1"># Update anchored particles' inverse mass to 0</span>
+
+    <span class="n">masses_dirty</span> <span class="o">=</span> <span class="bp">false</span>
+</code></pre></div></div>
+
+<p>Next we need to decide how to drive the simulation loop. I decided to just step the simulation once per <code class="language-plaintext highlighter-rouge">_physics_process</code> since it’ll be called with a consistent framerate regardless of what we choose for the fixed simulation timestep.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">func</span> <span class="nf">_physics_process</span><span class="p">(</span><span class="n">delta</span><span class="p">:</span> <span class="kt">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">simulation_paused</span><span class="p">:</span>
+        <span class="k">return</span>
+
+    <span class="o">...</span> <span class="c1"># Other early returns i.e. if not selected in editor</span>
+
+    <span class="k">if</span> <span class="n">dirty</span><span class="p">:</span>
+        <span class="n">rebuild</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">masses_dirty</span><span class="p">:</span>
+        <span class="n">regenerate_particle_masses</span><span class="p">()</span>
+
+    <span class="n">update_simulation</span><span class="p">()</span>
+    <span class="n">update_mesh</span><span class="p">()</span>
+    <span class="n">elapsed</span> <span class="o">+=</span> <span class="n">delta</span>
+</code></pre></div></div>
+
+<p>And finally this brings us to the actual simulation code. The <code class="language-plaintext highlighter-rouge">update_simulation</code> method itself is basically just a direct translation of the pseudocode from the algorithm above, but with a few modifications for force accumulation, anchors, and different collision modes.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">func</span> <span class="nf">update_simulation</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="k">var</span> <span class="n">particle_count</span> <span class="p">:</span><span class="o">=</span> <span class="n">segment_count</span> <span class="o">+</span> <span class="mi">1</span>
+
+    <span class="c1"># Apply forces and predict next positions</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">particle_count</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">inverse_masses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="mf">0.0</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="k">var</span> <span class="n">velocity</span> <span class="p">:</span><span class="o">=</span> <span class="n">velocities</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+        <span class="n">velocity</span> <span class="o">+=</span> <span class="n">gravity_acceleration</span> <span class="o">*</span> <span class="n">simulation_delta</span>
+        <span class="k">if</span> <span class="n">wind</span><span class="p">:</span>
+            <span class="n">velocity</span> <span class="o">+=</span> <span class="n">wind</span><span class="o">.</span><span class="n">sample</span><span class="p">(</span><span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">elapsed</span><span class="p">)</span> <span class="o">*</span> <span class="n">inverse_masses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">*</span> <span class="n">simulation_delta</span>
+        <span class="n">velocity</span> <span class="o">*=</span> <span class="n">damping_factors</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+        <span class="n">velocities</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">velocity</span>
+        <span class="n">damping_factors</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>
+        <span class="n">predicted</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">+</span> <span class="n">velocity</span> <span class="o">*</span> <span class="n">simulation_delta</span>
+
+    <span class="o">...</span> <span class="c1"># Update anchored particle positions</span>
+
+    <span class="c1"># Project constraints and resolve collisions</span>
+    <span class="k">match</span> <span class="n">collision_mode</span><span class="p">:</span>
+        <span class="n">CollisionMode</span><span class="o">.</span><span class="n">NONE</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">iter</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">solver_iterations</span><span class="p">):</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">segment_count</span><span class="p">):</span>
+                    <span class="n">project_segment</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="n">CollisionMode</span><span class="o">.</span><span class="n">FAST</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">iter</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">solver_iterations</span><span class="p">):</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">segment_count</span><span class="p">):</span>
+                    <span class="n">project_segment</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">particle_count</span><span class="p">):</span>
+                <span class="n">solve_collisions</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+        <span class="n">CollisionMode</span><span class="o">.</span><span class="n">ACCURATE</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">iter</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">solver_iterations</span><span class="p">):</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">segment_count</span><span class="p">):</span>
+                    <span class="n">project_segment</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="n">solve_collisions</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+                <span class="n">solve_collisions</span><span class="p">(</span><span class="n">segment_count</span><span class="p">)</span>
+
+    <span class="c1"># Update velocities and commit positions</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">particle_count</span><span class="p">):</span>
+        <span class="n">velocities</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">predicted</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">/</span> <span class="n">simulation_delta</span>
+        <span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">predicted</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+</code></pre></div></div>
+
+<h1 id="visuals">Visuals</h1>
+
+<p>Now that the rope is simulating, we need to render it. There is a well-known style of rope rendering that uses Catmull-Rom splines to generate a flat, camera-aligned mesh every frame that uses very little geometry while handling curved edges nicely, but for this project’s purposes, we want an actual 3D mesh that isn’t view-dependant. For this reason, we decided to go with a simple capsule mesh at the center of each segment.</p>
+
+<p>Since each segment will share the same geometry, and we need to render a bunch of segments at different locations, this is a situation where instanced rendering really shines. When we rebuild the rope, we can just set the number of instances in the <code class="language-plaintext highlighter-rouge">MultiMeshInstance3D</code>’s <code class="language-plaintext highlighter-rouge">MultiMesh</code> to be the number of segments in the rope, and once per frame (or whenever the rope actually updates), we can walk through all the segments and set the position of the corresponding mesh instance to the center of the segment.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">func</span> <span class="nf">rebuild_mesh</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="n">multimesh</span><span class="o">.</span><span class="n">instance_count</span> <span class="o">=</span> <span class="n">segment_count</span>
+    <span class="n">multimesh</span><span class="o">.</span><span class="n">visible_instance_count</span> <span class="o">=</span> <span class="n">segment_count</span>
+
+    <span class="k">if</span> <span class="n">segment_mesh_override</span><span class="p">:</span>
+        <span class="n">multimesh</span><span class="o">.</span><span class="n">mesh</span> <span class="o">=</span> <span class="n">segment_mesh_override</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">var</span> <span class="n">capsule</span> <span class="p">:</span><span class="o">=</span> <span class="n">CapsuleMesh</span><span class="o">.</span><span class="n">new</span><span class="p">()</span>
+        <span class="n">capsule</span><span class="o">.</span><span class="n">radius</span> <span class="o">=</span> <span class="n">radius</span>
+        <span class="n">capsule</span><span class="o">.</span><span class="n">height</span> <span class="o">=</span> <span class="n">segment_rest_length</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">radius</span> <span class="o">+</span> <span class="n">segment_overlap</span>
+        <span class="n">capsule</span><span class="o">.</span><span class="n">radial_segments</span> <span class="o">=</span> <span class="n">radial_segments</span>
+        <span class="n">capsule</span><span class="o">.</span><span class="n">rings</span> <span class="o">=</span> <span class="n">segment_cap_rings</span>
+        <span class="n">multimesh</span><span class="o">.</span><span class="n">mesh</span> <span class="o">=</span> <span class="n">capsule</span>
+
+    <span class="n">mesh_dirty</span> <span class="o">=</span> <span class="bp">false</span>
+
+<span class="k">func</span> <span class="nf">update_mesh</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">void</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">mesh_dirty</span><span class="p">:</span>
+        <span class="n">rebuild_mesh</span><span class="p">()</span>
+
+    <span class="k">var</span> <span class="n">inv_global</span> <span class="p">:</span><span class="o">=</span> <span class="n">global_transform</span><span class="o">.</span><span class="n">affine_inverse</span><span class="p">()</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">segment_count</span><span class="p">):</span>
+        <span class="k">var</span> <span class="n">p0</span> <span class="p">:</span><span class="o">=</span> <span class="n">positions</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+        <span class="k">var</span> <span class="n">p1</span> <span class="p">:</span><span class="o">=</span> <span class="n">positions</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+        <span class="k">var</span> <span class="n">pos</span> <span class="p">:</span><span class="o">=</span> <span class="p">(</span><span class="n">p0</span> <span class="o">+</span> <span class="n">p1</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.5</span>
+        <span class="k">var</span> <span class="n">segment</span> <span class="p">:</span><span class="o">=</span> <span class="n">p1</span> <span class="o">-</span> <span class="n">p0</span>
+        <span class="k">var</span> <span class="n">current_length</span> <span class="p">:</span><span class="o">=</span> <span class="n">segment</span><span class="o">.</span><span class="n">length</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">current_length</span> <span class="o">&lt;=</span> <span class="mf">0.001</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="o">...</span> <span class="c1"># Calculate orientation</span>
+
+        <span class="n">multimesh</span><span class="o">.</span><span class="n">set_instance_transform</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">inv_global</span> <span class="o">*</span> <span class="n">t</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>Calculating the position for each segment is trivial, but obtaining a stable orientation is a little more tricky. We want each capsule to be aligned so that the rope particles on either side of the segment are at the center of the base of each cap of the capsule. The problem is that there are infinitely many orientations that fulfill this requirement. In other words, once a segment is positioned in a valid orientation, you can twist it any amount and the orientation is still considered valid.</p>
+
+<p>Initially, I tried constructing orientations independently for each segment by choosing an arbitrary “up” direction and using the shortest arc rotation quaternion from the chosen up direction to the segment direction to construct a basis.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">var</span> <span class="n">orientation</span> <span class="p">:</span><span class="o">=</span> <span class="n">Quaternion</span><span class="p">(</span><span class="kt">Vector3</span><span class="o">.</span><span class="n">UP</span><span class="p">,</span> <span class="n">segment</span><span class="p">)</span>
+<span class="k">var</span> <span class="n">t</span> <span class="p">:</span><span class="o">=</span> <span class="n">Transform3D</span><span class="p">(</span><span class="kt">Basis</span><span class="p">(</span><span class="n">orientation</span><span class="p">),</span> <span class="n">pos</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>While this method appears to work well in many situations, it necessarily introduces unwanted twisting when the segment direction approaches the opposite of the chosen up direction. This is because there are infinitely many “shortest” arcs from any direction to its opposite.</p>
+
+<video src="/assets/videos/rope_twist_bug.mp4" controls="" preload="" loop=""></video>
+
+<p>An interesting thought experiment to build intuition for why this happens is to imagine somebody asked you what the shortest path is to walk straight along the earth’s surface from the south pole to the north pole. Assuming the earth is a perfect sphere with no hills or valleys, you could start out facing any direction, and by the time you reach the other pole, the distance travelled would be the exact same.<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" class="footnote" rel="footnote">2</a></sup></p>
+
+<p>A common workaround for this twisting issue is to choose a different up direction based on the alignment of the segment.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">var</span> <span class="n">reference_dir</span> <span class="p">:</span><span class="o">=</span> <span class="kt">Vector3</span><span class="o">.</span><span class="n">UP</span> <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">y</span> <span class="o">&gt;</span> <span class="mf">0.0</span> <span class="k">else</span> <span class="kt">Vector3</span><span class="o">.</span><span class="n">DOWN</span>
+<span class="k">var</span> <span class="n">orientation</span> <span class="p">:</span><span class="o">=</span> <span class="n">Quaternion</span><span class="p">(</span><span class="n">reference_dir</span><span class="p">,</span> <span class="n">segment</span><span class="p">)</span>
+<span class="k">var</span> <span class="n">t</span> <span class="p">:</span><span class="o">=</span> <span class="n">Transform3D</span><span class="p">(</span><span class="kt">Basis</span><span class="p">(</span><span class="n">orientation</span><span class="p">),</span> <span class="n">pos</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>This does make the orientations stable when facing up or down, but introduces a flip when segments cross the horizontal boundary. For a rotationally symmetric shape, the flipping might not be noticeable, but since we need to be able to attach arbitrary objects to the rope, having the attachment transform flip when the rope moves is unacceptable for our case.</p>
+
+<video src="/assets/videos/rope_flip_bug.mp4" controls="" preload="" loop=""></video>
+
+<p>The solution that I ended up going with is to construct a discrete <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/12/Computation-of-rotation-minimizing-frames.pdf">Rotation Minimizing Frame</a> (AKA <a href="https://en.wikipedia.org/wiki/Richard_L._Bishop">Bishop Frame</a>), using <a href="https://en.wikipedia.org/wiki/Parallel_transport">parallel transport</a>. The main idea is to take the orientation of the first segment and transport it sequentially down the rope, minimizing the rotation between each pair of adjacent segments. Since the first segment doesn’t have a previous segment to transport from, it can simply use its orientation from the previous simulation step.</p>
+
+<p>For this to work, technically you only need to store the first segment’s orientation, but I decided to store the orientation per segment so that attachments can more efficiently query transforms along the rope without having to transport the root orientation down to the attachment location every time.<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" class="footnote" rel="footnote">3</a></sup></p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">var</span> <span class="n">v</span> <span class="p">:</span><span class="o">=</span> <span class="n">segment_orientations</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="k">var</span> <span class="n">orientation</span> <span class="p">:</span><span class="o">=</span> <span class="n">Quaternion</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">y</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">z</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">w</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">segment_count</span><span class="p">):</span>
+    <span class="o">...</span>
+
+    <span class="k">var</span> <span class="n">tangent</span> <span class="p">:</span><span class="o">=</span> <span class="n">segment</span> <span class="o">/</span> <span class="n">current_length</span>
+    <span class="k">var</span> <span class="n">prev_tangent</span> <span class="p">:</span><span class="o">=</span> <span class="n">orientation</span> <span class="o">*</span> <span class="kt">Vector3</span><span class="o">.</span><span class="n">DOWN</span>
+    <span class="k">var</span> <span class="n">q_rot</span> <span class="p">:</span><span class="o">=</span> <span class="n">Quaternion</span><span class="p">(</span><span class="n">prev_tangent</span><span class="p">,</span> <span class="n">tangent</span><span class="p">)</span>
+    <span class="n">orientation</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_rot</span> <span class="o">*</span> <span class="n">orientation</span><span class="p">)</span><span class="o">.</span><span class="n">normalized</span><span class="p">()</span>
+    <span class="n">segment_orientations</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">Vector4</span><span class="p">(</span><span class="n">orientation</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">orientation</span><span class="o">.</span><span class="n">y</span><span class="p">,</span> <span class="n">orientation</span><span class="o">.</span><span class="n">z</span><span class="p">,</span> <span class="n">orientation</span><span class="o">.</span><span class="n">w</span><span class="p">)</span>
+
+    <span class="o">...</span>
+</code></pre></div></div>
+
+<p>This method of constructing orientations fixes both the flipping and twisting issues, and always settles into a stable configuration regardless of orientation.<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" class="footnote" rel="footnote">4</a></sup></p>
+
+<video src="/assets/videos/rope_orientation_transport.mp4" controls="" preload="" loop=""></video>
+
+<p>Another visual issue has to do with stiffness. When the rope’s stiffness is set to below 1.0 to make it stretch, its segments become visually separated, which is undesirable. As well, because PBD is an iterative solver, it may not converge to a stiff result immediately even with a stiffness of 1.0, meaning this separation can even happen with fully stiff ropes.</p>
+
+<video src="/assets/videos/rope_separation_bug.mp4" controls="" preload="" loop=""></video>
+
+<p>Thankfully, it’s very simple to account for this by simply adding a scaling factor to stretch each segment’s mesh instance proportional to the ratio between the current segment length and the resting segment length.</p>
+
+<div class="language-gdscript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">var</span> <span class="n">factor</span> <span class="p">:</span><span class="o">=</span> <span class="kt">Vector3</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">current_length</span> <span class="o">/</span> <span class="n">segment_rest_length</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="k">var</span> <span class="n">t</span> <span class="p">:</span><span class="o">=</span> <span class="n">Transform3D</span><span class="p">(</span><span class="kt">Basis</span><span class="p">(</span><span class="n">orientation</span><span class="p">),</span> <span class="n">pos</span><span class="p">)</span><span class="o">.</span><span class="n">scaled_local</span><span class="p">(</span><span class="n">factor</span><span class="p">)</span>
+</code></pre></div></div>
+
+<video src="/assets/videos/rope_separation_fix.mp4" controls="" preload="" loop=""></video>
+
+<p>Finally, we may want ropes that look like something other than a low-poly elongated capsule, so I added properties to adjust the resolution of the generated capsule geometry, as well as a mesh override resource that will be used instead of the generated capsule when supplied.</p>
+
+<video src="/assets/videos/rope_capsule_options.mp4" controls="" preload="" loop=""></video>
+
+<video src="/assets/videos/rope_segment_override.mp4" controls="" preload="" loop=""></video>
+
+<h1 id="collision">Collision</h1>
+
+<p>Now that the rope is rendering properly, it would be nice if it could collide with the environment! So far I’ve implemented 2 types of collision: raycast and sphere. Each of these can either be done once per frame after all solver iterations have finished (“Fast” mode), or in-step with distance constraint projection, repeated for each solver iteration (“Accurate” mode).</p>
+
+<p>The raycast collision type simply shoots a ray through each particle in the direction of that particle’s motion, and corrects the predicted position if an intersection occurs. It’s <em>very</em> resistant to velocity-based tunnelling, but it allows a significant amount of surface penetration, and cannot be pushed by moving geometry since it only detects collisions in the direction of motion.</p>
+
+<video src="/assets/videos/rope_collision_raycast.mp4" controls="" preload="" loop=""></video>
+
+<p>The sphere collision type does essentially the same thing, except it sweeps a full sphere representing each particle, rather than just a ray through the center. Sphere collisions remove the surface penetration slop from the raycasting method and allow the rope to be pushed by geometry moving under a certain speed, but are less resistant to velocity-based tunnelling against small or oddly-shaped objects, and are significantly slower to compute.</p>
+
+<video src="/assets/videos/rope_collision_sphere.mp4" controls="" preload="" loop=""></video>
+
+<p>The collisions work well, but one thing is still missing: friction. To avoid the ropes sliding along the ground forever like the world has frozen over, I also added a property called <code class="language-plaintext highlighter-rouge">contact_damping</code>, which is the proportion of velocity a particle should lose over 1 second of the simulation while contacting a surface. It’s only a cheap approximation of real friction, but it has the desired effect and is intuitively tunable by designers.</p>
+
+<video src="/assets/videos/rope_contact_damping_off.mp4" controls="" preload="" loop=""></video>
+
+<video src="/assets/videos/rope_contact_damping_on.mp4" controls="" preload="" loop=""></video>
+
+<h1 id="attachments--anchors">Attachments / Anchors</h1>
+
+<p>What we have so far is a stable and performant rope simulation, but it isn’t very useful for gameplay purposes yet, since all it can do is collide with solid geometry to affect its own movement. Currently, ropes aren’t able to affect or be detected by other objects in the scene. We could add some sort of collision tracking to the rope based on the contacts seen during the simulation and send out signals manually, but for all the different types of interactions a designer might want to model, I feel that trying to shoehorn all of that functionality into the rope itself is a bad idea.</p>
+
+<p>Instead, I think a cleaner solution is to add this functionality as needed via a robust attachment system. For one-way attachments this is very simple, and I went with a structure similar to how <code class="language-plaintext highlighter-rouge">BoneAttachment3D</code> nodes work with <code class="language-plaintext highlighter-rouge">Skeleton3D</code>. You can simply add a <code class="language-plaintext highlighter-rouge">RopeAttachment3D</code> as a child of a rope node and adjust its <code class="language-plaintext highlighter-rouge">t</code> property to position the attachment along the rope, optionally snapping to particles or the center of segments.</p>
+
+<video src="/assets/videos/rope_attachment_follow.mp4" controls="" preload="" loop=""></video>
+
+<p>With these one-way attachments, we can easily add more functionality to the ropes. For instance, if you want to detect when something is hit by the rope, you could attach <code class="language-plaintext highlighter-rouge">Area3D</code> nodes along the rope to use as hitboxes. A benefit of this approach is that you don’t have to pay the computational cost of testing intersections for every single segment, since you could easily use large capsules or spheres to approximate large sections of the rope:</p>
+
+<video src="/assets/videos/rope_attachment_area3d.mp4" controls="" preload="" loop=""></video>
+
+<p>The same could be done with an <code class="language-plaintext highlighter-rouge">AnimatableBody3D</code> to be able to push other rigid bodies in the scene as well:</p>
+
+<video src="/assets/videos/rope_attachment_animatablebody3d.mp4" controls="" preload="" loop=""></video>
+
+<p>For attachments in the other direction, you can change the <code class="language-plaintext highlighter-rouge">RopeAttachment3D</code>’s mode to <code class="language-plaintext highlighter-rouge">Mode.ANCHOR</code>, which will invert the relationship. In anchor mode, when snapping to the nearest particle, the attachment will write its global position to the closest particle during the simulation step. When snapping to segments or with snapping disabled, it will position the 2 closest particles <code class="language-plaintext highlighter-rouge">segment_rest_length</code> apart along its global Z axis, respecting the relative distance to each.</p>
+
+<video src="/assets/videos/rope_attachment_anchor.mp4" controls="" preload="" loop=""></video>
+
+<p>Two-way attachments (like being able to attach a rigid body to the rope in a physically plausible way) are more complicated, and I plan on tackling them in the next implementation once we gain the force estimates for each particle from implementing XPBD.</p>
+
+<h1 id="performance">Performance</h1>
+
+<p>The GDScript implementation ended up performing much better than I expected, but unfortunately still a bit short of the goals of the project, so I grabbed a clone of godot-cpp and the godot-cpp-template and ported the rope class to C++ GDExtension.</p>
+
+<p>As expected, even just a direct port resulted in huge performance gains, with ~13x speedup for ropes without collision, and ~3x speedup for ropes with raycast collisions on my test machine (a laptop with a core i5-1240p). Looming over these numbers however, is a problem that has been plaguing Godot for many years: its physics querying API.</p>
+
+<p>For those unaware, Godot’s physics querying API currently has a serious design flaw. The internal query methods are implemented well and are reasonably fast, but a few of the public-facing methods take their quickly gained result, <em>create a dictionary</em>, and re-store the result parameters into the dictionary before returning it. Not all of the query methods use a dictionary, but all of them do perform unnecessary allocations just for the return value which adversely affects performance. The current API was only meant to be a quick hack until a better solution was found, but as of now, no proposed solution has been accepted.</p>
+
+<p>That should be the end of the bad news though, because there is now a <a href="https://github.com/godotengine/godot/pull/113970">PR</a> which fixes the entire API by adding non-allocating, strongly typed versions of each query method alongside the existing implementation.<sup id="fnref:5" role="doc-noteref"><a href="#fn:5" class="footnote" rel="footnote">5</a></sup> Each new method takes a RefCounted result container as an argument, and stores its results into the pre-allocated object only if the query is successful (conveniently detected by the boolean return value from each new method).</p>
+
+<p>This makes it possible to create a result object once and reuse it for all queries, completely eliminating the per-query allocations that are currently required. Since the new result objects are real types, this also makes the new API type-safe and thus clearer and faster than the existing dictionary-based API which required explicit type annotations and string lookups to access each property of a given result.</p>
+
+<p>Using the new typed ray intersection method, the C++ ropes using raycast collisions saw an <strong>additional ~250% speedup</strong> <em>for the entire simulation step</em>, not even just the collision resolution phase. This means it more than doubled the amount of ropes that can be simulated in a given frame budget just from switching a single method call.</p>
+
+<p>In practice, this means that the same i5 laptop from before can now simulate 11,000 particles (1,000 ropes * 11 particles each) at a stable 60fps with raycast collisions enabled, <em>even in the editor</em>. With the current dictionary-based API, the same test begins to drop below 60fps anywhere past 3,000 particles, and turns into a slideshow well before 4,000.</p>
+
+<video src="/assets/videos/rope_cpp_stress_test.mp4" controls="" preload="" loop=""></video>
+
+<p>Discussion is still ongoing to settle on a naming scheme for the new methods and to evaluate any potential further improvements, but hopefully the improved API will be merged soon and becomes available in a future Godot release!</p>
+
+<h1 id="conclusion">Conclusion</h1>
+
+<p>This post is already way longer than I was hoping, so I’ll have to stop here for now. Next time I’ll probably be talking about the final implementation of the rope simulation, or potentially <a href="/assets/videos/tink_tink_fluid_teaser.mp4">something else</a>.</p>
+
+<p>I plan to release the final GDExtension C++ rope implementation as an addon for desktop platforms once it’s finished (and hopefully with that new physics API available). Until then, please feel free to play around with the GDScript implementation using the current API by downloading <a href="/assets/downloads/pbd_rope_3d_gd.zip">the code</a> and pasting the <code class="language-plaintext highlighter-rouge">addons/</code> folder into a Godot project. This implementation has been tested in Godot versions 4.5-stable, 4.6.3-stable, 4.7-stable, and the current 4.8 master branch as of writing.</p>
+
+<h1 id="references">References</h1>
+
+<ul>
+  <li><a href="https://matthias-research.github.io/pages/publications/posBasedDyn.pdf">https://matthias-research.github.io/pages/publications/posBasedDyn.pdf</a></li>
+  <li><a href="https://mmacklin.com/2017-EG-CourseNotes.pdf">https://mmacklin.com/2017-EG-CourseNotes.pdf</a></li>
+  <li><a href="https://carmencincotti.com/2022-08-01/the-pbd-simulation-loop/">https://carmencincotti.com/2022-08-01/the-pbd-simulation-loop/</a></li>
+  <li><a href="https://matthias-research.github.io/pages/publications/XPBD.pdf">https://matthias-research.github.io/pages/publications/XPBD.pdf</a></li>
+  <li><a href="https://matthias-research.github.io/pages/publications/smallsteps.pdf">https://matthias-research.github.io/pages/publications/smallsteps.pdf</a></li>
+  <li><a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/12/Computation-of-rotation-minimizing-frames.pdf">https://www.microsoft.com/en-us/research/wp-content/uploads/2016/12/Computation-of-rotation-minimizing-frames.pdf</a></li>
+  <li><a href="https://en.wikipedia.org/wiki/Richard_L._Bishop">https://en.wikipedia.org/wiki/Richard_L._Bishop</a></li>
+  <li><a href="https://en.wikipedia.org/wiki/Parallel_transport">https://en.wikipedia.org/wiki/Parallel_transport</a></li>
+  <li><a href="https://www.youtube.com/watch?v=BHdbsHFs2P0">https://www.youtube.com/watch?v=BHdbsHFs2P0</a></li>
+</ul>
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1" role="doc-endnote">
+      <p>XPBD itself does not increase the convergence rate of the simulation over PBD, but switching to multiple full substeps instead of just running the solver for multiple iterations inside of a single larger time step <em>does</em> speed up convergence. Even though substeps are more expensive when comparing <code class="language-plaintext highlighter-rouge">n</code> substeps with <code class="language-plaintext highlighter-rouge">n</code> iterations, we may actually gain performance overall since it should require less substeps than iterations to reach a similarly stiff result. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:2" role="doc-endnote">
+      <p><a href="https://www.youtube.com/@3blue1brown">3Blue1Brown</a> has a <a href="https://www.youtube.com/watch?v=BHdbsHFs2P0">great video</a> that goes into much greater detail about this concept if you enjoy math videos as much as I do :) <a href="#fnref:2" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:3" role="doc-endnote">
+      <p>There is no <code class="language-plaintext highlighter-rouge">PackedQuaternionArray</code> type or constructors to convert between <code class="language-plaintext highlighter-rouge">Vector4</code> and <code class="language-plaintext highlighter-rouge">Quaternion</code> directly so manual packing / unpacking to <code class="language-plaintext highlighter-rouge">PackedVector4Array</code> is required here. <a href="#fnref:3" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:4" role="doc-endnote">
+      <p>The twisting issue is technically still present, but only when 2 <em>adjacent</em> segments face in nearly opposite directions, which is a configuration that does not occur often, and rarely lasts longer than a few simulation steps when it does. <a href="#fnref:4" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:5" role="doc-endnote">
+      <p>For those wondering why the existing API isn’t simply replaced, it’s because that would require breaking changes that would make it more difficult for users to develop plugins or addons that work with multiple versions of the engine (among other issues). Leaving the existing API intact avoids making any breaking changes, while still allowing users of newer engine versions to use the improved API. <a href="#fnref:5" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>
+
+    </main>
+</body>
